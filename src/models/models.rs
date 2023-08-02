@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dtos::{EpochDataDto, SlotDataDto};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct EpochData {
     pub attestationscount: i64,
     pub attesterslashingscount: i64,

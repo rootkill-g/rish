@@ -1,21 +1,24 @@
+use std::sync::Arc;
+
 use crate::{
     models::{EpochData, SlotData},
     AppResult,
 };
 use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
+use tokio::sync::Mutex;
 
-pub async fn table_exists(conn: &SqlitePool, table_name: &str) -> AppResult<bool> {
+pub async fn table_exists(db_conn: Arc<Mutex<SqlitePool>>, table_name: &str) -> AppResult<bool> {
     let query = r#"SELECT name FROM sqlite_master WHERE type='table' AND name=?"#;
 
     let result = sqlx::query(query)
         .bind(table_name)
-        .fetch_optional(conn)
+        .fetch_optional(&*db_conn.lock().await)
         .await?;
 
     Ok(result.is_some())
 }
 
-async fn init_default_values(db_conn: &SqlitePool) -> AppResult<()> {
+async fn init_default_values(db_conn: Arc<Mutex<SqlitePool>>) -> AppResult<()> {
     let default_epoch = sqlx::query!(
         r#"
             SELECT *
@@ -24,7 +27,7 @@ async fn init_default_values(db_conn: &SqlitePool) -> AppResult<()> {
         "#,
         0
     )
-    .fetch_optional(db_conn)
+    .fetch_optional(&*db_conn.lock().await)
     .await?;
 
     let default_slot = sqlx::query!(
@@ -35,7 +38,7 @@ async fn init_default_values(db_conn: &SqlitePool) -> AppResult<()> {
         "#,
         0
     )
-    .fetch_optional(db_conn)
+    .fetch_optional(&*db_conn.lock().await)
     .await?;
 
     let default_epoch_data = EpochData {
@@ -103,14 +106,24 @@ async fn init_default_values(db_conn: &SqlitePool) -> AppResult<()> {
 
     match (default_epoch.is_some(), default_slot.is_some()) {
         (false, false) => {
-            insert_epoch(db_conn, default_epoch_data).await?;
-            insert_slot(db_conn, default_slot_data.slot, &default_slot_data).await?;
+            insert_epoch(Arc::clone(&db_conn), default_epoch_data).await?;
+            insert_slot(
+                Arc::clone(&db_conn),
+                default_slot_data.slot,
+                &default_slot_data,
+            )
+            .await?;
         }
         (false, true) => {
-            insert_epoch(db_conn, default_epoch_data).await?;
+            insert_epoch(Arc::clone(&db_conn), default_epoch_data).await?;
         }
         (true, false) => {
-            insert_slot(db_conn, default_slot_data.slot, &default_slot_data).await?;
+            insert_slot(
+                Arc::clone(&db_conn),
+                default_slot_data.slot,
+                &default_slot_data,
+            )
+            .await?;
         }
         (true, true) => (),
     }
@@ -120,7 +133,8 @@ async fn init_default_values(db_conn: &SqlitePool) -> AppResult<()> {
     Ok(())
 }
 
-pub async fn setup_db(db_url: &str, db_conn: &SqlitePool) -> AppResult<()> {
+pub async fn setup_db(db_url: &str, db_conn: Arc<Mutex<SqlitePool>>) -> AppResult<()> {
+    // let db_conn = db_conn.lock().await;
     if !Sqlite::database_exists(db_url).await.unwrap_or(false) {
         println!("Creating Database: {}", db_url);
 
@@ -131,22 +145,24 @@ pub async fn setup_db(db_url: &str, db_conn: &SqlitePool) -> AppResult<()> {
     } else {
         println!("Using the existing database");
 
-        let slot_table_exists = table_exists(db_conn, "slot_data").await?;
-        let epoch_table_exists = table_exists(db_conn, "epoch_data").await?;
+        let slot_table_exists = table_exists(Arc::clone(&db_conn), "slot_data").await?;
+        let epoch_table_exists = table_exists(Arc::clone(&db_conn), "epoch_data").await?;
 
         if slot_table_exists && epoch_table_exists {
             println!("Tables {} & {} already exists", "slot_data", "epoch_data");
 
             init_default_values(db_conn).await?;
         } else {
-            sqlx::migrate!("./migrations").run(db_conn).await?;
+            sqlx::migrate!("./migrations")
+                .run(&*db_conn.lock().await)
+                .await?;
         }
     }
 
     Ok(())
 }
 
-pub async fn insert_epoch(db_conn: &SqlitePool, epoch_data: EpochData) -> AppResult<()> {
+pub async fn insert_epoch(db_conn: Arc<Mutex<SqlitePool>>, epoch_data: EpochData) -> AppResult<()> {
     let existing_epoch = sqlx::query!(
         r#"
             SELECT * 
@@ -155,7 +171,7 @@ pub async fn insert_epoch(db_conn: &SqlitePool, epoch_data: EpochData) -> AppRes
         "#,
         epoch_data.epoch
     )
-    .fetch_optional(db_conn)
+    .fetch_optional(&*db_conn.lock().await)
     .await?;
 
     if existing_epoch.is_some() {
@@ -210,14 +226,14 @@ pub async fn insert_epoch(db_conn: &SqlitePool, epoch_data: EpochData) -> AppRes
             epoch_data.votedether,
             epoch_data.withdrawalcount
         )
-        .execute(db_conn)
+        .execute(&*db_conn.lock().await)
         .await?;
     }
     Ok(())
 }
 
 pub async fn update_epoch(
-    db_conn: &SqlitePool,
+    db_conn: Arc<Mutex<SqlitePool>>,
     epoch_number: i64,
     updated_epoch_data: EpochData,
 ) -> AppResult<()> {
@@ -229,7 +245,7 @@ pub async fn update_epoch(
         "#,
         epoch_number
     )
-    .fetch_optional(db_conn)
+    .fetch_optional(&*db_conn.lock().await)
     .await?;
 
     if existence_check.is_some() {
@@ -283,7 +299,7 @@ pub async fn update_epoch(
             updated_epoch_data.withdrawalcount,
             epoch_number
         )
-        .execute(db_conn)
+        .execute(&*db_conn.lock().await)
         .await?;
     } else {
         return Err(Box::new(std::io::Error::new(
@@ -295,10 +311,13 @@ pub async fn update_epoch(
     Ok(())
 }
 
-pub async fn insert_slot(db_conn: &SqlitePool, slot_number: i64, slot: &SlotData) -> AppResult<()> {
-    println!("Checking if slot {slot_number} already exists in the database or not!");
+pub async fn insert_slot(
+    db_conn: Arc<Mutex<SqlitePool>>,
+    slot_number: i64,
+    slot: &SlotData,
+) -> AppResult<()> {
     let existing_slot = sqlx::query!(r#"SELECT * FROM slot_data WHERE slot = ?"#, slot_number)
-        .fetch_optional(db_conn)
+        .fetch_optional(&*db_conn.lock().await)
         .await?;
 
     if existing_slot.is_some() {
@@ -385,7 +404,7 @@ pub async fn insert_slot(db_conn: &SqlitePool, slot_number: i64, slot: &SlotData
                 slot.voluntaryexitscount,
                 slot.withdrawalcount,
         )
-        .execute(db_conn)
+        .execute(&*db_conn.lock().await)
         .await?;
     }
 
@@ -393,7 +412,7 @@ pub async fn insert_slot(db_conn: &SqlitePool, slot_number: i64, slot: &SlotData
 }
 
 pub async fn update_slot(
-    db_conn: &SqlitePool,
+    db_conn: Arc<Mutex<SqlitePool>>,
     slot_number: i64,
     updated_slot: SlotData,
 ) -> AppResult<()> {
@@ -405,7 +424,7 @@ pub async fn update_slot(
         "#,
         slot_number
     )
-    .fetch_optional(db_conn)
+    .fetch_optional(&*db_conn.lock().await)
     .await?;
 
     if existing_slot.is_some() {
@@ -488,7 +507,7 @@ pub async fn update_slot(
             updated_slot.withdrawalcount,
             slot_number
         )
-        .execute(db_conn)
+        .execute(&*db_conn.lock().await)
         .await?;
 
         Ok(())
@@ -502,7 +521,7 @@ pub async fn update_slot(
 
 // Create Models for Database, and handle bool <-> i64 relationship
 // of database and dto
-pub async fn get_latest_epoch_data(db_conn: &SqlitePool) -> AppResult<EpochData> {
+pub async fn get_latest_epoch_data(db_conn: Arc<Mutex<SqlitePool>>) -> AppResult<EpochData> {
     let latest_epoch_data = sqlx::query_as!(
         EpochData,
         r#"
@@ -512,13 +531,13 @@ pub async fn get_latest_epoch_data(db_conn: &SqlitePool) -> AppResult<EpochData>
             LIMIT 1;
         "#
     )
-    .fetch_one(db_conn)
+    .fetch_one(&*db_conn.lock().await)
     .await?;
 
     Ok(latest_epoch_data)
 }
 
-pub async fn get_latest_unexecuted_slot(db_conn: &SqlitePool) -> AppResult<SlotData> {
+pub async fn get_latest_unexecuted_slot(db_conn: Arc<Mutex<SqlitePool>>) -> AppResult<SlotData> {
     let latest_slot_data = sqlx::query_as!(
         SlotData,
         r#"
@@ -529,7 +548,7 @@ pub async fn get_latest_unexecuted_slot(db_conn: &SqlitePool) -> AppResult<SlotD
             LIMIT 1;
         "#
     )
-    .fetch_one(db_conn)
+    .fetch_one(&*db_conn.lock().await)
     .await?;
 
     Ok(latest_slot_data)

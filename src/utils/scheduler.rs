@@ -1,245 +1,209 @@
-use super::{external_api::get_specific_epoch_data, get_specific_slot};
-use crate::{
-    db_ops, dtos::EpochDataDto, models::EpochData, utils::fetch_recent_epoch_slots, AppResult,
-};
+use std::{sync::Arc, time::SystemTime};
+
+use super::{external_api::get_specific_epoch_data, get_specific_epoch_slots};
+use crate::{db_ops, models::SlotData, AppResult};
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
-use tokio::time::{self, Duration};
+use std::time::UNIX_EPOCH;
+use tokio::{
+    sync::Mutex,
+    time::{self, Duration},
+};
 
-async fn epoch_data_scheduler(
-    db_conn: SqlitePool,
-    current_epoch_data: EpochDataDto,
-) -> AppResult<()> {
-    println!("SCHEDULER EPOCH DATA FETCHER: Scheduler to fetch new epoch is started");
+pub async fn fetch_latest_epoch(db_conn: Arc<Mutex<SqlitePool>>) -> AppResult<()> {
+    println!("SCHEDULER_1: Started");
+
     let interval = Duration::from_secs(384);
-    let mut latest_epoch_data = current_epoch_data;
-    let mut epoch_number = latest_epoch_data.epoch + 1;
 
-    loop {
-        println!("Waiting for epoch {epoch_number} now.");
-        println!("Epoch Data Scheduler Sleeping for 384 seconds now");
+    println!("SCHEDULER_1: Fetching latest Epoch Data from Chain");
 
-        time::sleep(interval).await;
-        println!("Epoch Data Scheduler is Awake");
-        println!("Fetching epoch {epoch_number} from chain");
-        latest_epoch_data = get_specific_epoch_data("latest").await?;
+    let latest_epoch_on_chain = get_specific_epoch_data("latest").await?;
 
-        println!("Putting epoch {epoch_number} from chain into database");
-        db_ops::db_ops::insert_epoch(&db_conn, latest_epoch_data.into()).await?;
+    println!("SCHEDULER_1: Inserting latest Epoch Data into DB");
 
-        println!("Latest epoch data is fetched and put into the database.");
+    db_ops::insert_epoch(Arc::clone(&db_conn), latest_epoch_on_chain.clone().into()).await?;
 
-        epoch_number = epoch_number + 1;
-    }
-}
+    println!("SCHEDULER_1: Fetching latest Epoch Slots from Chain");
 
-pub async fn new_epoch_data_schedule_runner(db_conn: SqlitePool) -> AppResult<()> {
-    println!("Getting latest epoch in database");
+    let latest_epoch_slots_on_chain = get_specific_epoch_slots(latest_epoch_on_chain.epoch).await?;
 
-    let current_epoch_data = db_ops::get_latest_epoch_data(&db_conn).await?;
+    println!("SCHEDULER_1: Inserting latest Epoch Slots into DB");
 
-    println!("Lastest Epoch in DB is: {}", current_epoch_data.epoch);
-
-    println!("Getting latest epoch on chain");
-
-    let latest_epoch_data = get_specific_epoch_data("latest").await?;
-    let latest_epoch_data_for_db: EpochData = latest_epoch_data.clone().into();
-    db_ops::insert_epoch(&db_conn, latest_epoch_data_for_db).await?;
-    let how_many = latest_epoch_data.epoch - current_epoch_data.epoch;
-
-    println!("Database is {how_many} epoch behind chain");
-
-    match how_many {
-        0 => {
-            println!("Current epoch in DB and Latest epoch on chain are same");
-            println!(
-                "Checking the timestamps and fetching the epoch {}",
-                current_epoch_data.epoch + 1
-            );
-
-            println!("Setting initial interval");
-            let positive_time = (12
-                + DateTime::<Utc>::from_utc(
-                    DateTime::parse_from_rfc3339(&current_epoch_data.ts)
-                        .expect("Failed to parse timestamp string")
-                        .naive_utc(),
-                    Utc,
-                )
-                .timestamp())
-                - Utc::now().timestamp();
-            let initial_interval = if positive_time > 0 {
-                time::Duration::from_secs(positive_time.try_into().unwrap())
-            } else {
-                time::Duration::from_secs(0)
-            };
-
-            println!("Epoch Data Scheduler Runner is Sleeping");
-            time::sleep(initial_interval).await;
-            println!("Epoch Data Scheduler Runner is Awake");
-            println!("Fetching latest epoch data from chain");
-            get_specific_epoch_data("latest").await?;
-
-            println!("Putting latest epoch data from chain into database");
-            db_ops::insert_epoch(&db_conn, latest_epoch_data.into()).await?;
-
-            println!("Latest epoch data is fetched and put into the database.");
-            println!("Epoch Data Scheduler Runner is Initiating The Scheduler");
-
-            let _ =
-                tokio::spawn(async { epoch_data_scheduler(db_conn, current_epoch_data.into()) })
-                    .await?;
-        }
-        1..=4 => {
-            println!("Current epoch in DB is {how_many} epoch behind from on chain");
-            println!("Fetching {how_many} epochs from chain");
-
-            fetch_recent_epoch_slots(db_conn.clone(), how_many).await?;
-
-            println!("Fetched {how_many} epochs and stored in DB");
-            println!("Epoch Data Scheduler Runner is Initiating The Scheduler");
-
-            let _ =
-                tokio::spawn(async { epoch_data_scheduler(db_conn, current_epoch_data.into()) })
-                    .await?;
-        }
-        _ => {
-            println!("Current epoch in DB is 5/5+ epoch behind from on chain");
-            println!("Fetching five recent epochs from chain");
-
-            fetch_recent_epoch_slots(db_conn.clone(), 5).await?;
-
-            let current_epoch_data = db_ops::get_latest_epoch_data(&db_conn).await?;
-
-            println!("Fetched {how_many} epochs and stored in DB");
-            println!("Epoch Data Scheduler Runner is Initiating The Scheduler");
-
-            let _ =
-                tokio::spawn(async { epoch_data_scheduler(db_conn, current_epoch_data.into()) })
-                    .await?;
-        }
+    for slot in latest_epoch_slots_on_chain {
+        let db_slot: SlotData = slot.into();
+        db_ops::insert_slot(Arc::clone(&db_conn), db_slot.slot, &db_slot).await?;
     }
 
-    Ok(())
-}
-
-pub async fn update_current_epoch(db_conn: SqlitePool) -> AppResult<()> {
-    println!("SCHEDULER UPDATE EPOCH: Scheduler for updating current epoch is started");
-    let interval = Duration::from_secs(12);
-    println!("Fetching latest epoch data in database");
-    let current_epoch_data = db_ops::get_latest_epoch_data(&db_conn).await?;
-    println!("Latest Epoch in DATABASE: {}", current_epoch_data.epoch);
-    let mut current_epoch_number = current_epoch_data.epoch;
-    println!("Setting initial interval");
-    let current_epoch_time = DateTime::<Utc>::from_utc(
-        DateTime::parse_from_rfc3339(&current_epoch_data.ts)
-            .expect("Failed to parse timestamp string")
+    let latest_epoch_timestamp = DateTime::<Utc>::from_utc(
+        DateTime::parse_from_rfc3339(&latest_epoch_on_chain.ts)
+            .expect("Failed to parse epoch timestamp")
             .naive_utc(),
         Utc,
     )
-    .timestamp() as u64;
-    let current_time = Utc::now().timestamp() as u64;
+    .timestamp();
 
-    println!("Epoch Time Tag: {current_epoch_time}");
-    println!("Current Time Tag: {current_time}");
-    let positive_time = (12
-        + DateTime::<Utc>::from_utc(
-            DateTime::parse_from_rfc3339(&current_epoch_data.ts)
-                .expect("Failed to parse timestamp string")
+    println!(
+        "SCHEDULER_1: Latest Epoch TimeStamp = {}",
+        latest_epoch_timestamp,
+    );
+    println!(
+        "SCHEDULER_1: Current System Timestamp: {}",
+        Utc::now().timestamp()
+    );
+
+    let time_since_update = SystemTime::now()
+        .duration_since(UNIX_EPOCH + Duration::from_secs(latest_epoch_timestamp as u64))
+        .unwrap_or_else(|_| Duration::from_secs(0));
+
+    println!(
+        "SCHEDULER_1: Time since update: {}",
+        time_since_update.as_secs()
+    );
+
+    let time_remaining = if time_since_update > interval {
+        Duration::from_secs(12)
+    } else {
+        interval - time_since_update
+    };
+
+    println!(
+        "SCHEDULER_1: Time Remaining for Next Epoch : {}",
+        time_remaining.as_secs()
+    );
+
+    println!("SCHEDULER_1: Sleeping");
+
+    time::sleep(time_remaining).await;
+
+    println!("SCHEDULER_1: Awake");
+
+    loop {
+        println!("SCHEDULER_1: Fetching latest Epoch Data from Chain");
+
+        let latest_epoch_on_chain = get_specific_epoch_data("latest").await?;
+
+        println!("SCHEDULER_1: Inserting latest Epoch Data in DB");
+
+        db_ops::insert_epoch(Arc::clone(&db_conn), latest_epoch_on_chain.clone().into()).await?;
+
+        println!("SCHEDULER_1: Fetching latest Epoch Slots from Chain");
+
+        let latest_epoch_slots_on_chain =
+            get_specific_epoch_slots(latest_epoch_on_chain.epoch).await?;
+
+        println!("SCHEDULER_1: Inserting latest Epoch Slots into DB");
+
+        for slot in latest_epoch_slots_on_chain {
+            let db_slot: SlotData = slot.into();
+            db_ops::insert_slot(Arc::clone(&db_conn), db_slot.slot, &db_slot).await?;
+        }
+
+        let latest_epoch_timestamp = DateTime::<Utc>::from_utc(
+            DateTime::parse_from_rfc3339(&latest_epoch_on_chain.ts)
+                .expect("Failed to parse epoch timestamp")
                 .naive_utc(),
             Utc,
         )
-        .timestamp())
-        - Utc::now().timestamp();
-    let initial_interval = if positive_time > 0 {
-        time::Duration::from_secs(positive_time.try_into().unwrap())
+        .timestamp();
+
+        println!(
+            "SCHEDULER_1: Latest Epoch TimeStamp = {}",
+            latest_epoch_timestamp,
+        );
+
+        println!(
+            "SCHEDULER_1: Current System TimeStamp = {}",
+            Utc::now().timestamp()
+        );
+
+        let time_since_update = SystemTime::now()
+            .duration_since(UNIX_EPOCH + Duration::from_secs(latest_epoch_timestamp as u64))
+            .unwrap_or_else(|_| Duration::from_secs(0));
+
+        println!(
+            "SCHEDULER_1: Time since update: {}",
+            time_since_update.as_secs()
+        );
+
+        let time_remaining = if time_since_update > interval {
+            Duration::from_secs(12)
+        } else {
+            interval - time_since_update
+        };
+
+        println!(
+            "SCHEDULER_1: Time Remaining for Next Epoch : {}",
+            time_remaining.as_secs()
+        );
+
+        println!("SCHEDULER_1: Sleeping");
+
+        time::sleep(time_remaining).await;
+
+        println!("SCHEDULER_1: Awake");
+    }
+}
+
+pub async fn update_current_epoch_and_slots(db_conn: Arc<Mutex<SqlitePool>>) -> AppResult<()> {
+    println!("SCHEDULER_2: Started");
+
+    let interval = Duration::from_secs(12);
+
+    println!("SCHEDULER_2: Pulling latest epoch from DB");
+
+    let latest_unexecuted_slot_in_db =
+        db_ops::get_latest_unexecuted_slot(Arc::clone(&db_conn)).await?;
+
+    let latest_unexecuted_slot_timestamp = latest_unexecuted_slot_in_db.exec_timestamp.unwrap();
+
+    let time_since_update = SystemTime::now()
+        .duration_since(UNIX_EPOCH + Duration::from_secs(latest_unexecuted_slot_timestamp as u64))
+        .unwrap_or_else(|_| Duration::from_secs(0));
+    let time_remaining = if time_since_update > interval {
+        Duration::from_secs(0)
     } else {
-        time::Duration::from_secs(0)
+        interval - time_since_update
     };
 
-    println!("SCHEDULER UPDATE EPOCH: is Sleeping");
+    println!("SCHEDULER_2: Sleeping");
 
-    time::sleep(initial_interval).await;
+    time::sleep(time_remaining).await;
 
-    println!("SCHEDULER UPDATE EPOCH: is Awake");
-    println!("Fetching epoch {current_epoch_number} data from chain");
-    let mut updated_current_epoch_data =
-        get_specific_epoch_data(&format!("{current_epoch_number}")).await?;
-
-    println!("Putting updated epoch {current_epoch_number} into database");
-    db_ops::update_epoch(
-        &db_conn,
-        current_epoch_number,
-        updated_current_epoch_data.into(),
-    )
-    .await?;
-
-    println!("Initial update applied to current epoch {current_epoch_number}");
+    println!("SCHEDULER_2: Awake");
 
     loop {
-        println!("SCHEDULER UPDATE EPOCH: is Sleeping");
-        time::sleep(interval).await;
-        println!("SCHEDULER UPDATE EPOCH: is Awake");
+        println!("SCHEDULER_2: Pulling latest epoch from DB");
 
-        println!("Fetching latest epoch data from database");
-        let current_epoch_data = db_ops::get_latest_epoch_data(&db_conn).await?;
-        current_epoch_number = current_epoch_data.epoch;
+        let current_epoch_data_in_db = db_ops::get_latest_epoch_data(Arc::clone(&db_conn)).await?;
+        let current_epoch_number = current_epoch_data_in_db.epoch;
 
-        println!("Fetching the updated epoch {current_epoch_number} from chain");
-        updated_current_epoch_data =
+        println!("SCHEDULER_2: Fetching Epoch {current_epoch_number} Data from chain");
+        let updated_current_epoch_data =
             get_specific_epoch_data(&format!("{current_epoch_number}")).await?;
 
-        println!("Putting the epoch {current_epoch_number} data from chain into database");
+        println!("SCHEDULER_2: Fetching Epoch {current_epoch_number} Slots from chain");
+
+        let updated_current_epoch_slots = get_specific_epoch_slots(current_epoch_number).await?;
+
+        println!("SCHEDULER_2: Updating the Epoch {current_epoch_number} in DB");
+
         db_ops::update_epoch(
-            &db_conn,
+            Arc::clone(&db_conn),
             current_epoch_number,
             updated_current_epoch_data.into(),
         )
         .await?;
 
-        println!("Waiting for the epoch data for epoch {current_epoch_number} to be updated");
-    }
-}
+        println!("SCHEDULER_2: Updating the slots for Epoch {current_epoch_number} into the DB");
 
-pub async fn update_unexecuted_slot(db_conn: SqlitePool) -> AppResult<()> {
-    println!("Getting latest unexecuted slot in database");
-    let latest_slot_in_db = db_ops::get_latest_unexecuted_slot(&db_conn).await?;
-    let mut latest_slot_number = latest_slot_in_db.slot;
-    println!("Slot {latest_slot_number} is unexecuted, fetching updated slot from chain");
-    let latest_slot_ts = latest_slot_in_db.exec_timestamp;
-    println!("Setting initial interval");
-    let positive_time = 12 - (Utc::now().timestamp() - latest_slot_ts.unwrap());
-    let initial_interval = if positive_time > 0 {
-        time::Duration::from_secs(positive_time.try_into().unwrap())
-    } else {
-        time::Duration::from_secs(0)
-    };
+        for slot in updated_current_epoch_slots {
+            db_ops::update_slot(Arc::clone(&db_conn), slot.slot, slot.clone().into()).await?;
+        }
 
-    println!("SCHEDULER UPDATE SLOT: is Sleeping");
-    time::sleep(initial_interval).await;
+        println!("SCHEDULER_2: Sleeping");
 
-    println!("SCHEDULER UPDATE SLOT: is Awake");
-    latest_slot_number = latest_slot_number + 1;
-    println!("Fetching slot {latest_slot_number} from chain");
-    let unexecuted_slot_data = get_specific_slot(latest_slot_number).await?;
-    let interval = Duration::from_secs(12);
-
-    println!("Putting slot {latest_slot_number} from chain into database");
-    db_ops::update_slot(&db_conn, latest_slot_number, unexecuted_slot_data.into()).await?;
-
-    loop {
-        println!("Waiting for slot {} now.", latest_slot_number);
-
-        println!("SCHEDULER UPDATE SLOT: is Sleeping now");
         time::sleep(interval).await;
-        println!("SCHEDULER UPDATE SLOT: is Awake");
-        println!("Fetching updated slot {latest_slot_number} data from chain");
-        let next_slot_data = get_specific_slot(latest_slot_number).await?;
 
-        println!("Putting updated slot {latest_slot_number} data from chain into database");
-        db_ops::update_slot(&db_conn, latest_slot_number, next_slot_data.into()).await?;
-
-        println!("Latest executed slot data is fetched and updated in the database.");
-
-        latest_slot_number = latest_slot_number + 1;
+        println!("SCHEDULER_2: Awake");
     }
 }

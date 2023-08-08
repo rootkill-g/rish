@@ -76,13 +76,21 @@ pub async fn fetch_recent_epoch_slots(
     Ok(())
 }
 
-// pub async fn get_specific_slot(slot_number: i64) -> AppResult<SlotDataDto> {
-//     let api_key = env!("API_KEY");
-//     let url = format!("{BEACON_CHAIN_API_URL}/slot/{slot_number}?apikey={api_key}");
-//     let response = get(url).await?.text().await?;
-//     println!("Slot {slot_number} fetched successfully from chain");
-//     let slot: SlotDataDto = serde_json::from_str(&response)?;
-//     println!("Slot deserialized successfully");
-//     println!("Slot {slot_number} inserted into db successfully");
-//     Ok(slot)
-// }
+pub async fn get_specific_slot(slot_number: i64) -> AppResult<SlotDataDto> {
+    let api_key = env!("API_KEY");
+    let url = format!("{BEACON_CHAIN_API_URL}/slot/{slot_number}?apikey={api_key}");
+    let response = get(url).await?.text().await?;
+    println!("Slot {slot_number} fetched successfully from chain");
+    let slot: SlotDataDto = serde_json::from_str(&response)?;
+    println!("Slot deserialized successfully");
+    db_ops::db_ops::insert_slot(
+        Arc::new(Mutex::new(
+            SqlitePool::connect(env!("DATABASE_URL")).await.unwrap(),
+        )),
+        slot_number,
+        &slot.clone().into(),
+    )
+    .await?;
+    println!("Slot {slot_number} inserted into db successfully");
+    Ok(slot)
+}

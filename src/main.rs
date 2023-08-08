@@ -3,42 +3,50 @@ mod dtos;
 mod models;
 mod utils;
 
-use dtos::SlotDataDto;
-use once_cell::sync::OnceCell;
+// use dtos::SlotDataDto;
+// use once_cell::sync::OnceCell;
 use salvo::prelude::*;
-use sqlx::SqlitePool;
+use sqlx::{sqlite::SqliteArgumentValue, SqlitePool};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use utils::scheduler;
 
-static SQLITE: OnceCell<SqlitePool> = OnceCell::new();
+// static SQLITE: OnceCell<SqlitePool> = OnceCell::new();
 
-#[inline]
-pub fn get_sqlite() -> &'static SqlitePool {
-    unsafe { SQLITE.get_unchecked() }
-}
+// #[inline]
+// pub fn get_sqlite() -> &'static SqlitePool {
+//     unsafe { SQLITE.get_unchecked() }
+// }
 
 pub type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[handler]
 async fn get_specific_slot(req: &mut Request, res: &mut Response) {
-    let slot_number = req.query::<i64>("slot").unwrap();
-    let data = sqlx::query_as!(
-        models::SlotData,
-        r#"
-            SELECT * 
-            FROM slot_data
-            WHERE slot = ?
-            "#,
-        slot_number
+    let slot_number = req.param::<i64>("slot").unwrap();
+    println!("API CALLED: Fetching Slot: {slot_number} from records.");
+    let slot_dto = db_ops::api_get_specific_slot(
+        Arc::new(Mutex::new(
+            SqlitePool::connect(env!("DATABASE_URL")).await.unwrap(),
+        )),
+        slot_number,
     )
-    .fetch_optional(get_sqlite())
     .await
     .unwrap();
+    res.render(Json(slot_dto))
+}
 
-    let dto: SlotDataDto = data.unwrap().into();
-
-    res.render(serde_json::to_string(&dto).unwrap())
+#[handler]
+async fn get_recent_epoch_slots(_req: &mut Request, res: &mut Response) {
+    let epoch_number = db_ops::get_latest_epoch_data(Arc::new(Mutex::new(
+        SqlitePool::connect(env!("DATABASE_URL")).await.unwrap(),
+    )))
+    .await
+    .unwrap()
+    .epoch;
+    let slots = utils::external_api::get_specific_epoch_slots(epoch_number)
+        .await
+        .unwrap();
+    res.render(Json(slots))
 }
 
 #[tokio::main]
@@ -68,10 +76,21 @@ async fn main() -> AppResult<()> {
     // let task3 =
     //     tokio::spawn(async move { scheduler::update_unexecuted_slot(db_pool_thread_3) }).await?;
 
-    let router = Router::with_path("slot").get(get_specific_slot);
+    let (tx, rx) = oneshot::channel();
+    let router = Router::new()
+        .push(Router::with_path("slot/<slot>").get(get_specific_slot))
+        .push(Router::with_path("recent_five").get(get_recent_epoch_slots));
     let acceptor = TcpListener::new("127.0.0.1:5800").bind().await;
 
-    Server::new(acceptor).serve(router).await;
+    let server = Server::new(acceptor).serve_with_graceful_shutdown(
+        router,
+        async {
+            rx.await.ok();
+        },
+        None,
+    );
+
+    tokio::spawn(server);
 
     let (result1, result2) = tokio::join!(task1, task2);
 
@@ -89,6 +108,8 @@ async fn main() -> AppResult<()> {
     //     Ok(_) => println!("Thread 3 executed successfully"),
     //     Err(e) => eprintln!("Error in Thread 3 : {e}"),
     // }
+
+    let _ = tx.send(());
 
     Ok(())
 }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     models::{EpochData, SlotData},
-    AppResult,
+    utils, AppResult,
 };
 use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
 use tokio::sync::Mutex;
@@ -554,27 +554,30 @@ pub async fn get_latest_unexecuted_slot(db_conn: Arc<Mutex<SqlitePool>>) -> AppR
     Ok(latest_slot_data)
 }
 
-// pub async fn api_get_specific_slot(db_conn: &SqlitePool, slot_number: i64) -> AppResult<SlotData> {
-//     let existing_slot = sqlx::query_as!(
-//         SlotData,
-//         r#"
-//             SELECT *
-//             FROM slot_data
-//             WHERE slot = ?
-//         "#,
-//         slot_number
-//     )
-//     .fetch_optional(db_conn)
-//     .await?;
-//     if let Some(slot) = existing_slot {
-//         Ok(slot)
-//     } else {
-//         println!("Slot {slot_number} not found in DB, fetching slot from beacon chain...");
-//         Ok(utils::external_api::get_specific_slot(db_conn, slot_number)
-//             .await?
-//             .into())
-//     }
-// }
+pub async fn api_get_specific_slot(
+    db_conn: Arc<Mutex<SqlitePool>>,
+    slot_number: i64,
+) -> AppResult<SlotData> {
+    let existing_slot = sqlx::query_as!(
+        SlotData,
+        r#"
+            SELECT *
+            FROM slot_data
+            WHERE slot = ?
+        "#,
+        slot_number
+    )
+    .fetch_optional(&*db_conn.lock().await)
+    .await?;
+    if let Some(slot) = existing_slot {
+        Ok(slot)
+    } else {
+        println!("Slot {slot_number} not found in DB, fetching slot from beacon chain...");
+        Ok(utils::external_api::get_specific_slot(slot_number)
+            .await?
+            .into())
+    }
+}
 
 // pub async fn api_get_five_recent_epoch_slots(db_conn: &SqlitePool) -> AppResult<Vec<SlotData>> {
 //     let one_sixty_slots = sqlx::query_as!(
